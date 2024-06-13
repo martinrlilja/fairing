@@ -31,13 +31,22 @@ enum Commands {
         object_store_url: Url,
     },
     #[command(arg_required_else_help = true)]
-    Push {
+    Deploy {
         #[arg(long)]
         create_site: bool,
+
+        #[arg(long)]
+        stage: bool,
 
         site_name: String,
         remote: String,
         path: PathBuf,
+    },
+    #[command(arg_required_else_help = true)]
+    Activate {
+        site_name: String,
+        deployment_id: Uuid,
+        remote: String,
     },
 }
 
@@ -76,8 +85,9 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
             axum::serve(listener, app).await.unwrap();
         }
-        Commands::Push {
+        Commands::Deploy {
             create_site,
+            stage,
             site_name,
             remote,
             path: base_path,
@@ -178,18 +188,54 @@ async fn main() -> Result<()> {
                     .unwrap();
             }
 
+            let update_site = if stage {
+                UpdateSite {
+                    finalize_deployment_id: Some(deployment.id),
+                    current_deployment_id: None,
+                }
+            } else {
+                UpdateSite {
+                    finalize_deployment_id: Some(deployment.id),
+                    current_deployment_id: Some(deployment.id),
+                }
+            };
+
+            client
+                .put(format!("{remote}/api/v1/sites/{site_name}"))
+                .json(&update_site)
+                .send()
+                .await?
+                .error_for_status()
+                .unwrap();
+
+            if stage {
+                println!(
+                    "Staged deployment ({}) to {site_name}.",
+                    deployment.id.hyphenated()
+                );
+            } else {
+                println!("Deployed ({}) to {site_name}.", deployment.id.hyphenated());
+            }
+        }
+        Commands::Activate {
+            site_name,
+            deployment_id,
+            remote,
+        } => {
+            let client = reqwest::Client::new();
+
             client
                 .put(format!("{remote}/api/v1/sites/{site_name}"))
                 .json(&UpdateSite {
-                    finalize_deployment_id: Some(deployment.id),
-                    current_deployment_id: Some(deployment.id),
+                    finalize_deployment_id: None,
+                    current_deployment_id: Some(deployment_id),
                 })
                 .send()
                 .await?
                 .error_for_status()
                 .unwrap();
 
-            println!("Deployed {}", deployment.id.hyphenated());
+            println!("Deployed ({}) to {site_name}.", deployment_id.hyphenated());
         }
     }
 
