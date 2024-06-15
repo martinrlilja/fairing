@@ -112,8 +112,7 @@ async fn main() -> Result<()> {
 
                     if file_type.is_file() {
                         let entry_path = entry.path();
-                        let mut relative_path =
-                            entry_path.strip_prefix(&base_path).unwrap().to_owned();
+                        let relative_path = entry_path.strip_prefix(&base_path).unwrap().to_owned();
 
                         let extension = relative_path
                             .extension()
@@ -211,15 +210,6 @@ async fn main() -> Result<()> {
 
                         let hash = blake3::hash(&data_with_header);
 
-                        let mut is_directory = false;
-
-                        if relative_path.ends_with("index.html")
-                            || relative_path.ends_with("index.htm")
-                        {
-                            relative_path = relative_path.parent().unwrap().to_owned();
-                            is_directory = true;
-                        }
-
                         let mut web_path = String::new();
 
                         for part in relative_path.iter() {
@@ -227,16 +217,23 @@ async fn main() -> Result<()> {
                             web_path.push_str(part.to_str().unwrap());
                         }
 
-                        if web_path.is_empty() || is_directory {
-                            web_path.push_str("/");
+                        let index_path = web_path
+                            .strip_suffix("/index.html")
+                            .or_else(|| web_path.strip_suffix("/index.htm"));
+
+                        if let Some(index_path) = index_path {
+                            if !index_path.is_empty() {
+                                // todo: add a redirect here
+                            }
+
+                            found_files.push((
+                                format!("{index_path}/"),
+                                hash.to_hex().to_string(),
+                                data_with_header.clone(),
+                            ));
                         }
 
-                        found_files.push((
-                            web_path,
-                            entry.path(),
-                            hash.to_hex().to_string(),
-                            data_with_header,
-                        ));
+                        found_files.push((web_path, hash.to_hex().to_string(), data_with_header));
                     }
                 }
             }
@@ -263,7 +260,7 @@ async fn main() -> Result<()> {
                     site_name: site_name.clone(),
                     files: found_files
                         .iter()
-                        .map(|(path, _, hash, _)| CreateDeploymentFiles {
+                        .map(|(path, hash, _)| CreateDeploymentFiles {
                             path: path.clone(),
                             hash: hash.clone(),
                         })
@@ -279,9 +276,9 @@ async fn main() -> Result<()> {
             let mut upload_tasks = vec![];
 
             for file_to_upload in deployment.files_to_upload {
-                let (_, _, _, data_with_header) = found_files
+                let (_, _, data_with_header) = found_files
                     .iter()
-                    .find(|(path, _, _, _)| path == &file_to_upload)
+                    .find(|(path, _, _)| path == &file_to_upload)
                     .unwrap();
 
                 let upload_limit = upload_limit.clone();
