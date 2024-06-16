@@ -56,7 +56,7 @@ enum Commands {
 }
 
 struct AppState {
-    object_store: Box<dyn ObjectStore>,
+    object_store: Arc<dyn ObjectStore>,
     base_path: object_store::path::Path,
 }
 
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
             let (object_store, base_path) = object_store::parse_url(&object_store_url)?;
 
             let app_state = Arc::new(AppState {
-                object_store,
+                object_store: object_store.into(),
                 base_path,
             });
 
@@ -594,6 +594,12 @@ async fn create_deployment(
     State(state): State<Arc<AppState>>,
     Json(create_deployment): Json<CreateDeployment>,
 ) -> (StatusCode, Json<Deployment>) {
+    use arrow::array::{ArrayRef, FixedSizeBinaryArray, RecordBatch, StringArray};
+    use parquet::{
+        arrow::async_writer::AsyncArrowWriter, basic::Compression,
+        file::properties::WriterProperties, format::SortingColumn,
+    };
+
     let deployment = Deployment {
         id: Uuid::now_v7(),
         files_to_upload: create_deployment
@@ -603,16 +609,22 @@ async fn create_deployment(
             .collect(),
     };
 
-    let deployment_path = state
+    let deployment_dir_path = state
         .base_path
         .child("sites")
         .child(create_deployment.site_name.as_str())
         .child("deployments")
-        .child(deployment.id.to_string())
-        .child("metadata.json");
+        .child(deployment.id.to_string());
+
+    let deployment_path = deployment_dir_path.child("metadata.json");
+
+    let deployment_files_path = deployment_dir_path.child("files.parquet");
 
     let deployment_stage_meta = serde_json::to_vec(&create_deployment).unwrap();
 
+    // println!("writing {} bytes json", deployment_stage_meta.len());
+
+    // metadata.json must be created first to avoid data races.
     state
         .object_store
         .put_opts(
@@ -626,6 +638,51 @@ async fn create_deployment(
         .await
         .unwrap();
 
+    let mut files = create_deployment.files;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let sample_path = Arc::new(StringArray::new_null(0)) as ArrayRef;
+    let sample_hash = Arc::new(FixedSizeBinaryArray::new_null(32, 0)) as ArrayRef;
+    let sample =
+        RecordBatch::try_from_iter([("path", sample_path), ("hash", sample_hash)]).unwrap();
+
+    let writer_props = WriterProperties::builder()
+        .set_compression(Compression::LZ4_RAW)
+        .set_sorting_columns(Some(vec![SortingColumn::new(0, false, false)]))
+        .build();
+
+    let mut buffer = Vec::new();
+    let mut writer =
+        AsyncArrowWriter::try_new(&mut buffer, sample.schema(), Some(writer_props)).unwrap();
+
+    for chunk in files.chunks(1024) {
+        let paths = Arc::new(StringArray::from_iter_values(
+            chunk.iter().map(|v| v.path.clone()),
+        )) as ArrayRef;
+
+        let hashes = Arc::new(
+            FixedSizeBinaryArray::try_from_iter(chunk.iter().map(|v| {
+                let hash: blake3::Hash = v.hash.parse().unwrap();
+                hash.as_bytes().to_vec()
+            }))
+            .unwrap(),
+        ) as ArrayRef;
+
+        let batch = RecordBatch::try_from_iter([("path", paths), ("hash", hashes)]).unwrap();
+
+        writer.write(&batch).await.unwrap();
+    }
+
+    writer.close().await.unwrap();
+
+    // println!("writing {} bytes parquet", buffer.len());
+
+    state
+        .object_store
+        .put(&deployment_files_path, buffer.into())
+        .await
+        .unwrap();
+
     (StatusCode::CREATED, Json(deployment))
 }
 
@@ -634,6 +691,17 @@ async fn create_file(
     Query(query): Query<CreateFileQuery>,
     body: Bytes,
 ) -> StatusCode {
+    use arrow::{
+        array::{cast::downcast_array, FixedSizeBinaryArray, Scalar, StringArray},
+        compute::kernels::cmp::eq,
+    };
+    use futures::TryStreamExt;
+    use parquet::arrow::{
+        arrow_reader::{ArrowPredicateFn, RowFilter},
+        async_reader::ParquetObjectReader,
+        ParquetRecordBatchStreamBuilder, ProjectionMask,
+    };
+
     let deployment_dir_path = state
         .base_path
         .child("sites")
@@ -641,23 +709,46 @@ async fn create_file(
         .child("deployments")
         .child(query.deployment_id.to_string());
 
-    let deployment_path = deployment_dir_path.child("metadata.json");
+    let deployment_files_path = deployment_dir_path.child("files.parquet");
 
-    let deployment_stage_meta_obj = state.object_store.get(&deployment_path).await.unwrap();
-    let deployment_stage_meta: CreateDeployment =
-        serde_json::from_slice(&deployment_stage_meta_obj.bytes().await.unwrap()).unwrap();
+    let deployment_files_meta = state
+        .object_store
+        .head(&deployment_files_path)
+        .await
+        .unwrap();
 
-    let Some(file) = deployment_stage_meta
-        .files
-        .iter()
-        .find(|f| f.path == query.path)
-    else {
+    let reader = ParquetObjectReader::new(state.object_store.clone(), deployment_files_meta);
+    let builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .unwrap()
+        .with_batch_size(1024);
+
+    let file_metadata = builder.metadata().file_metadata();
+
+    let scalar = StringArray::from(vec![query.path.clone()]);
+    let filter = ArrowPredicateFn::new(
+        ProjectionMask::roots(file_metadata.schema_descr(), [0]),
+        move |record_batch| eq(record_batch.column(0), &Scalar::new(&scalar)),
+    );
+
+    let mask = ProjectionMask::roots(file_metadata.schema_descr(), [1]);
+    let builder = builder
+        .with_projection(mask)
+        .with_row_filter(RowFilter::new(vec![Box::new(filter)]));
+
+    let stream = builder.build().unwrap();
+    let results = stream.try_collect::<Vec<_>>().await.unwrap();
+
+    let Some(file) = results.first() else {
         return StatusCode::BAD_REQUEST;
     };
 
+    let hash_array: FixedSizeBinaryArray = downcast_array(file.column(0));
+    let file_hash = hash_array.value(0);
+
     let hash = blake3::hash(&body);
 
-    if hash.to_hex().to_string() != file.hash {
+    if hash.as_bytes() != file_hash {
         return StatusCode::BAD_REQUEST;
     }
 
