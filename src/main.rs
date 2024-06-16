@@ -156,57 +156,86 @@ async fn main() -> Result<()> {
 
                         let data = fs::read(entry.path()).await?;
 
-                        let sample_data_len = data.len().min(1024);
-                        let mut gzip_ratio_buf = vec![];
-                        flate2::read::GzEncoder::new(
-                            &data[..sample_data_len],
-                            flate2::Compression::best(),
-                        )
-                        .read_to_end(&mut gzip_ratio_buf)?;
+                        let mut metadata = FileMetadata {
+                            headers: vec![(
+                                "content-type".to_owned(),
+                                format!("{}/{}", content_type.0, content_type.1),
+                            )],
+                            variants: vec![],
+                        };
+                        let mut variants_data = vec![];
 
-                        let gzip_ratio = gzip_ratio_buf.len() as f32 / sample_data_len as f32;
+                        let is_compressible = {
+                            let sample_data_len = data.len().min(1024);
 
-                        // Check if the gzip ratio is good enough to justify the additional
-                        // computation.
-                        let (variation, data) = if gzip_ratio < 0.9 {
+                            let mut ratio_buf = vec![];
+                            flate2::read::GzEncoder::new(
+                                &data[..sample_data_len],
+                                flate2::Compression::new(6),
+                            )
+                            .read_to_end(&mut ratio_buf)?;
+
+                            let ratio = sample_data_len as f64 / ratio_buf.len() as f64;
+
+                            // Check if the gzip ratio is good enough to justify the additional
+                            // computation.
+                            ratio > 1.2
+                        };
+
+                        // gzip
+                        if is_compressible {
                             let mut gzip_data = vec![];
                             flate2::read::GzEncoder::new(&data[..], flate2::Compression::best())
                                 .read_to_end(&mut gzip_data)?;
 
-                            (
-                                FileMetadataVariation {
+                            // println!("gzip {relative_path:?} {:.2} {}/{}", data.len() as f64 / gzip_data.len() as f64, data.len(), gzip_data.len());
+
+                            if gzip_data.len() < data.len() {
+                                metadata.variants.push(FileMetadataVariant {
                                     len: gzip_data.len() as u64,
                                     headers: vec![(
                                         "content-encoding".to_string(),
                                         "gzip".to_string(),
                                     )],
-                                },
-                                gzip_data,
-                            )
-                        } else {
-                            (
-                                FileMetadataVariation {
-                                    len: data.len() as u64,
-                                    headers: vec![],
-                                },
-                                data,
-                            )
-                        };
+                                });
+                                variants_data.push(gzip_data);
+                            }
+                        }
 
-                        let metadata = FileMetadata {
-                            headers: vec![(
-                                "content-type".to_owned(),
-                                format!("{}/{}", content_type.0, content_type.1),
-                            )],
-                            variations: vec![variation],
-                        };
+                        // zstd
+                        if is_compressible && data.len() > 512 * 1024 {
+                            let zstd_data = zstd::encode_all(&data[..], 14)?;
+
+                            // println!("zstd {relative_path:?} {:.2} {}/{}", data.len() as f64 / zstd_data.len() as f64, data.len(), zstd_data.len());
+
+                            if zstd_data.len() < data.len() {
+                                metadata.variants.push(FileMetadataVariant {
+                                    len: zstd_data.len() as u64,
+                                    headers: vec![(
+                                        "content-encoding".to_string(),
+                                        "zstd".to_string(),
+                                    )],
+                                });
+                                variants_data.push(zstd_data);
+                            }
+                        }
+
+                        if variants_data.is_empty() {
+                            metadata.variants.push(FileMetadataVariant {
+                                len: data.len() as u64,
+                                headers: vec![],
+                            });
+                            variants_data.push(data);
+                        }
 
                         let mut data_with_header = vec![1];
 
                         let bincode_options = bincode::options().allow_trailing_bytes();
                         bincode_options.serialize_into(&mut data_with_header, &metadata)?;
 
-                        data_with_header.extend_from_slice(&data);
+                        for variant_data in variants_data {
+                            data_with_header.extend_from_slice(&variant_data);
+                        }
 
                         let hash = blake3::hash(&data_with_header);
 
@@ -367,11 +396,11 @@ async fn main() -> Result<()> {
 #[derive(Debug, Deserialize, Serialize)]
 struct FileMetadata {
     headers: Vec<(String, String)>,
-    variations: Vec<FileMetadataVariation>,
+    variants: Vec<FileMetadataVariant>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct FileMetadataVariation {
+struct FileMetadataVariant {
     len: u64,
     headers: Vec<(String, String)>,
 }
@@ -387,6 +416,7 @@ struct GetFilePath {
 
 async fn get_file(
     State(state): State<Arc<AppState>>,
+    req_headers: HeaderMap,
     Path(path): Path<GetFilePath>,
 ) -> impl IntoResponse {
     let mut headers = HeaderMap::new();
@@ -458,8 +488,24 @@ async fn get_file(
         .child(&path_hash_hex[..2])
         .child(&path_hash_hex[2..]);
 
-    let file_obj = state.object_store.get(&file_path).await.unwrap();
-    let file_raw = file_obj.bytes().await.unwrap().to_vec();
+    let file_raw = match state.object_store.get(&file_path).await {
+        Ok(file_obj) => file_obj.bytes().await.unwrap().to_vec(),
+        Err(object_store::Error::NotFound { .. }) => {
+            headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+            return (StatusCode::NOT_FOUND, headers, b"not found".to_vec());
+        }
+        Err(err) => {
+            tracing::error!("get_file: file {err:?}");
+
+            headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                headers,
+                b"internal error".to_vec(),
+            );
+        }
+    };
+
     let mut file_cursor = Cursor::new(&file_raw[1..]);
 
     let file_header: FileMetadata = bincode::options()
@@ -476,9 +522,59 @@ async fn get_file(
         );
     }
 
-    let variation = file_header.variations.first().unwrap();
+    let largest_file_size = file_header
+        .variants
+        .iter()
+        .map(|variant| variant.len)
+        .max()
+        .unwrap();
 
-    for (header_name, header_value) in variation.headers.iter() {
+    let accept_encoding = req_headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+
+    let mut variant_ratings = file_header
+        .variants
+        .iter()
+        .scan(0u64, |offset, variant| {
+            let variant_offset = *offset;
+            *offset += variant.len;
+            Some((variant_offset, variant))
+        })
+        .map(|(offset, variant)| {
+            let size_preference = ((variant.len as f64 / largest_file_size as f64) * 100.0) as u32;
+
+            let content_encoding_header = variant
+                .headers
+                .iter()
+                .find(|(name, _value)| name.eq_ignore_ascii_case("content-encoding"));
+
+            if let Some((_, content_encoding)) = content_encoding_header {
+                let accepts_encoding = accept_encoding
+                    .and_then(|accept_encoding| {
+                        accept_encoding
+                            .split(",")
+                            .map(|v| v.trim())
+                            .find(|v| v.eq_ignore_ascii_case(content_encoding))
+                    })
+                    .is_some();
+
+                if accepts_encoding {
+                    (size_preference, offset, variant)
+                } else {
+                    (100 + size_preference, offset, variant)
+                }
+            } else {
+                (100 + size_preference, offset, variant)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    variant_ratings.sort_by_key(|&(rating, _, _)| rating);
+
+    let &(_, offset, variant) = variant_ratings.first().unwrap();
+
+    for (header_name, header_value) in variant.headers.iter() {
         headers.insert(
             HeaderName::try_from(header_name).unwrap(),
             header_value.parse().unwrap(),
@@ -488,7 +584,9 @@ async fn get_file(
     (
         StatusCode::OK,
         headers,
-        file_raw[header_length..header_length + variation.len as usize].to_owned(),
+        file_raw[header_length + offset as usize
+            ..header_length + offset as usize + variant.len as usize]
+            .to_owned(),
     )
 }
 
