@@ -12,6 +12,7 @@ use axum::{
 };
 use bincode::Options;
 use clap::{Parser, Subcommand};
+use fastbloom::BloomFilter;
 use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -481,29 +482,52 @@ async fn get_file(
         );
     };
 
-    let file_path = site_path
-        .child("deployments")
-        .child(deployment_id.to_string())
-        .child("files")
-        .child(&path_hash_hex[..2])
-        .child(&path_hash_hex[2..]);
+    let deployment_index = site_metadata
+        .finalized_deployment_ids
+        .iter()
+        .position(|&v| v == deployment_id)
+        .unwrap();
 
-    let file_raw = match state.object_store.get(&file_path).await {
-        Ok(file_obj) => file_obj.bytes().await.unwrap().to_vec(),
-        Err(object_store::Error::NotFound { .. }) => {
-            headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
-            return (StatusCode::NOT_FOUND, headers, b"not found".to_vec());
-        }
-        Err(err) => {
-            tracing::error!("get_file: file {err:?}");
+    let bloom_filter = BloomFilter::from_vec(site_metadata.bloom_filter)
+        .seed(&1)
+        .hashes(20);
 
-            headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                headers,
-                b"internal error".to_vec(),
-            );
+    let mut file_raw = None;
+
+    for deployment_id in &site_metadata.finalized_deployment_ids[deployment_index..] {
+        if !bloom_filter.contains(&(deployment_id, path_hash)) {
+            continue;
         }
+
+        let file_path = site_path
+            .child("deployments")
+            .child(deployment_id.to_string())
+            .child("files")
+            .child(&path_hash_hex[..2])
+            .child(&path_hash_hex[2..]);
+
+        match state.object_store.get(&file_path).await {
+            Ok(file_obj) => {
+                file_raw = Some(file_obj.bytes().await.unwrap().to_vec());
+                break;
+            }
+            Err(object_store::Error::NotFound { .. }) => (),
+            Err(err) => {
+                tracing::error!("get_file: file {err:?}");
+
+                headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
+                    b"internal error".to_vec(),
+                );
+            }
+        };
+    }
+
+    let Some(file_raw) = file_raw else {
+        headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+        return (StatusCode::NOT_FOUND, headers, b"not found".to_vec());
     };
 
     let mut file_cursor = Cursor::new(&file_raw[1..]);
@@ -600,6 +624,8 @@ async fn create_deployment(
         file::properties::WriterProperties, format::SortingColumn,
     };
 
+    // todo: do a diff of files that need to be uploaded, and mark the deployment metadata
+    // with the id of the deployment the diff is based on to detect stale deployments.
     let deployment = Deployment {
         id: Uuid::now_v7(),
         files_to_upload: create_deployment
@@ -782,6 +808,7 @@ async fn create_site(
     let site_metadata = SiteMetadata {
         current_deployment_id: None,
         finalized_deployment_ids: vec![],
+        bloom_filter: vec![0u64; 512 * 1024 / 8],
     };
 
     let site_metadata_raw = serde_json::to_vec(&site_metadata).unwrap();
@@ -856,6 +883,12 @@ async fn update_site(
         let deployment_metadata: CreateDeployment =
             serde_json::from_slice(&deployment_metadata).unwrap();
 
+        // todo: verify if the deployment is stale.
+
+        let mut bloom_filter = BloomFilter::from_vec(site_metadata.bloom_filter)
+            .seed(&1)
+            .hashes(20);
+
         for file in deployment_metadata.files.iter() {
             let path_hash = blake3::hash(&file.path.as_bytes());
             let path_hash_hex = path_hash.to_hex();
@@ -875,12 +908,15 @@ async fn update_site(
                     return StatusCode::INTERNAL_SERVER_ERROR;
                 }
             };
+
+            bloom_filter.insert(&(finalize_deployment_id, path_hash));
         }
 
         site_metadata
             .finalized_deployment_ids
             .push(finalize_deployment_id);
         site_metadata.finalized_deployment_ids.rotate_right(1);
+        site_metadata.bloom_filter = bloom_filter.as_slice().to_vec();
     }
 
     if let Some(current_deployment_id) = update_site.current_deployment_id {
@@ -944,6 +980,7 @@ struct CreateFileQuery {
 struct SiteMetadata {
     current_deployment_id: Option<Uuid>,
     finalized_deployment_ids: Vec<Uuid>,
+    bloom_filter: Vec<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
