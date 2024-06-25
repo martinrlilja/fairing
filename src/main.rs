@@ -232,7 +232,13 @@ async fn main() -> Result<()> {
                         let mut data_with_header = vec![1];
 
                         let bincode_options = bincode::options().allow_trailing_bytes();
-                        bincode_options.serialize_into(&mut data_with_header, &metadata)?;
+                        bincode_options.serialize_into(
+                            &mut data_with_header,
+                            &FileMetadataFormat::V1Alpha1 {
+                                headers: metadata.headers,
+                                variants: metadata.variants,
+                            },
+                        )?;
 
                         for variant_data in variants_data {
                             data_with_header.extend_from_slice(&variant_data);
@@ -395,6 +401,14 @@ async fn main() -> Result<()> {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+enum FileMetadataFormat {
+    V1Alpha1 {
+        headers: Vec<(String, String)>,
+        variants: Vec<FileMetadataVariant>,
+    },
+}
+
+#[derive(Debug)]
 struct FileMetadata {
     headers: Vec<(String, String)>,
     variants: Vec<FileMetadataVariant>,
@@ -431,12 +445,13 @@ async fn get_file(
         .base_path
         .child("sites")
         .child(path.site_name.as_str());
-    let site_metadata_path = site_path.child("metadata.json");
+    let site_metadata_path = site_path.child("metadata.bc");
 
-    let site_metadata: SiteMetadata = match state.object_store.get(&site_metadata_path).await {
+    let site_metadata: SiteMetadataFormat = match state.object_store.get(&site_metadata_path).await
+    {
         Ok(site_metadata_obj) => {
             let site_metadata_raw = site_metadata_obj.bytes().await.unwrap();
-            serde_json::from_slice(&site_metadata_raw).unwrap()
+            bincode::options().deserialize(&site_metadata_raw).unwrap()
         }
         Err(object_store::Error::NotFound { .. }) => {
             headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
@@ -452,6 +467,20 @@ async fn get_file(
                 b"internal error".to_vec(),
             );
         }
+    };
+
+    let site_metadata = match site_metadata {
+        SiteMetadataFormat::V1Alpha1 {
+            current_deployment_id,
+            finalized_deployment_ids,
+            bloom_filter_seed,
+            bloom_filter,
+        } => SiteMetadata {
+            current_deployment_id,
+            finalized_deployment_ids,
+            bloom_filter_seed,
+            bloom_filter,
+        },
     };
 
     let path_hash = blake3::hash(full_path.as_bytes());
@@ -489,7 +518,7 @@ async fn get_file(
         .unwrap();
 
     let bloom_filter = BloomFilter::from_vec(site_metadata.bloom_filter)
-        .seed(&1)
+        .seed(&site_metadata.bloom_filter_seed)
         .hashes(20);
 
     let mut file_raw = None;
@@ -532,12 +561,16 @@ async fn get_file(
 
     let mut file_cursor = Cursor::new(&file_raw[1..]);
 
-    let file_header: FileMetadata = bincode::options()
+    let file_header: FileMetadataFormat = bincode::options()
         .allow_trailing_bytes()
         .deserialize_from(&mut file_cursor)
         .unwrap();
 
     let header_length = 1 + file_cursor.position() as usize;
+
+    let file_header = match file_header {
+        FileMetadataFormat::V1Alpha1 { headers, variants } => FileMetadata { headers, variants },
+    };
 
     for (header_name, header_value) in file_header.headers.iter() {
         headers.insert(
@@ -803,15 +836,16 @@ async fn create_site(
         .base_path
         .child("sites")
         .child(create_site.name.as_str())
-        .child("metadata.json");
+        .child("metadata.bc");
 
-    let site_metadata = SiteMetadata {
+    let site_metadata = SiteMetadataFormat::V1Alpha1 {
         current_deployment_id: None,
         finalized_deployment_ids: vec![],
+        bloom_filter_seed: Uuid::new_v4().as_u128(),
         bloom_filter: vec![0u64; 512 * 1024 / 8],
     };
 
-    let site_metadata_raw = serde_json::to_vec(&site_metadata).unwrap();
+    let site_metadata_raw = bincode::options().serialize(&site_metadata).unwrap();
 
     let res = state
         .object_store
@@ -841,9 +875,11 @@ async fn update_site(
     Json(update_site): Json<UpdateSite>,
 ) -> StatusCode {
     let site_path = state.base_path.child("sites").child(site_name.as_str());
-    let site_metadata_path = site_path.child("metadata.json");
+    let site_metadata_path = site_path.child("metadata.bc");
 
-    let (mut site_metadata, site_metadata_obj_meta) =
+    let bincode_options = bincode::options();
+
+    let (site_metadata, site_metadata_obj_meta) =
         match state.object_store.get(&site_metadata_path).await {
             Ok(site_metadata_obj) => {
                 let site_metadata_obj_meta = object_store::UpdateVersion {
@@ -852,8 +888,8 @@ async fn update_site(
                 };
 
                 let site_metadata_raw = site_metadata_obj.bytes().await.unwrap();
-                let site_metadata: SiteMetadata =
-                    serde_json::from_slice(&site_metadata_raw).unwrap();
+                let site_metadata: SiteMetadataFormat =
+                    bincode_options.deserialize(&site_metadata_raw).unwrap();
 
                 (site_metadata, site_metadata_obj_meta)
             }
@@ -865,6 +901,20 @@ async fn update_site(
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
         };
+
+    let mut site_metadata = match site_metadata {
+        SiteMetadataFormat::V1Alpha1 {
+            current_deployment_id,
+            finalized_deployment_ids,
+            bloom_filter_seed,
+            bloom_filter,
+        } => SiteMetadata {
+            current_deployment_id,
+            finalized_deployment_ids,
+            bloom_filter_seed,
+            bloom_filter,
+        },
+    };
 
     if let Some(finalize_deployment_id) = update_site.finalize_deployment_id {
         let deployment_path = site_path
@@ -886,7 +936,7 @@ async fn update_site(
         // todo: verify if the deployment is stale.
 
         let mut bloom_filter = BloomFilter::from_vec(site_metadata.bloom_filter)
-            .seed(&1)
+            .seed(&site_metadata.bloom_filter_seed)
             .hashes(20);
 
         for file in deployment_metadata.files.iter() {
@@ -930,7 +980,14 @@ async fn update_site(
         }
     }
 
-    let site_metadata_raw = serde_json::to_vec(&site_metadata).unwrap();
+    let site_metadata_raw = bincode_options
+        .serialize(&SiteMetadataFormat::V1Alpha1 {
+            current_deployment_id: site_metadata.current_deployment_id,
+            finalized_deployment_ids: site_metadata.finalized_deployment_ids,
+            bloom_filter_seed: site_metadata.bloom_filter_seed,
+            bloom_filter: site_metadata.bloom_filter,
+        })
+        .unwrap();
 
     state
         .object_store
@@ -977,9 +1034,20 @@ struct CreateFileQuery {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+enum SiteMetadataFormat {
+    V1Alpha1 {
+        current_deployment_id: Option<Uuid>,
+        finalized_deployment_ids: Vec<Uuid>,
+        bloom_filter_seed: u128,
+        bloom_filter: Vec<u64>,
+    },
+}
+
+#[derive(Debug)]
 struct SiteMetadata {
     current_deployment_id: Option<Uuid>,
     finalized_deployment_ids: Vec<Uuid>,
+    bloom_filter_seed: u128,
     bloom_filter: Vec<u64>,
 }
 
