@@ -275,7 +275,7 @@ async fn main() -> Result<()> {
                 }
             }
 
-            println!("Found {} files to upload.", found_files.len());
+            println!("Found {} files.", found_files.len());
 
             let client = reqwest::Client::new();
 
@@ -311,6 +311,16 @@ async fn main() -> Result<()> {
 
             let upload_limit = Arc::new(tokio::sync::Semaphore::new(4));
             let mut upload_tasks = vec![];
+
+            print!(
+                "Uploading {} missing file",
+                deployment.files_to_upload.len()
+            );
+
+            if deployment.files_to_upload.len() != 1 {
+                print!("s");
+            }
+            println!(".");
 
             for file_to_upload in deployment.files_to_upload {
                 let (_, _, data_with_header) = found_files
@@ -725,7 +735,7 @@ async fn create_deployment(
         .seed(&site_metadata.bloom_filter_seed)
         .hashes(20);
 
-    let _base_deployment_id = site_metadata.finalized_deployment_ids.first().cloned();
+    let base_deployment_id = site_metadata.finalized_deployment_ids.first().cloned();
 
     for old_deployment_id in site_metadata.finalized_deployment_ids.iter() {
         let found_files = create_deployment
@@ -820,14 +830,14 @@ async fn create_deployment(
         .child("deployments")
         .child(deployment_id.to_string());
 
-    let deployment_path = deployment_dir_path.child("metadata.json");
+    let deployment_path = deployment_dir_path.child("metadata.bc");
 
-    let deployment_files_path = deployment_dir_path.child("files.parquet");
-
-    // TODO: store the base id
-    let deployment_stage_meta = serde_json::to_vec(&create_deployment).unwrap();
-
-    // println!("writing {} bytes json", deployment_stage_meta.len());
+    let deployment_stage_meta = bincode::options()
+        .serialize(&DeploymentMetadataFormat::V1Alpha1 {
+            id: deployment_id,
+            base_deployment_id,
+        })
+        .unwrap();
 
     // metadata.json must be created first to avoid data races.
     state
@@ -842,6 +852,8 @@ async fn create_deployment(
         )
         .await
         .unwrap();
+
+    let deployment_files_path = deployment_dir_path.child("files.parquet");
 
     let mut files = create_deployment.files;
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -961,7 +973,7 @@ async fn create_file(
     let hash = blake3::hash(&body);
 
     if hash.as_bytes() != file_hash {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::UNPROCESSABLE_ENTITY;
     }
 
     let path_hash = blake3::hash(&query.path.as_bytes());
@@ -1080,7 +1092,7 @@ async fn update_site(
             .child("deployments")
             .child(finalize_deployment_id.to_string());
 
-        let deployment_metadata_path = deployment_dir_path.child("metadata.json");
+        let deployment_metadata_path = deployment_dir_path.child("metadata.bc");
 
         let deployment_metadata_obj = state
             .object_store
@@ -1090,10 +1102,20 @@ async fn update_site(
 
         let deployment_metadata = deployment_metadata_obj.bytes().await.unwrap();
 
-        let _deployment_metadata: CreateDeployment =
-            serde_json::from_slice(&deployment_metadata).unwrap();
+        let deployment_metadata: DeploymentMetadataFormat = bincode::options()
+            .deserialize(&deployment_metadata)
+            .unwrap();
 
-        // todo: verify if the deployment is stale.
+        let base_deployment_id = match deployment_metadata {
+            DeploymentMetadataFormat::V1Alpha1 {
+                base_deployment_id, ..
+            } => base_deployment_id,
+        };
+
+        // make sure the deployment is not stale
+        if base_deployment_id.as_ref() != site_metadata.finalized_deployment_ids.first() {
+            return StatusCode::UNPROCESSABLE_ENTITY;
+        }
 
         let deployment_files_path = deployment_dir_path.child("files.parquet");
 
@@ -1217,6 +1239,12 @@ enum DeploymentMetadataFormat {
         id: Uuid,
         base_deployment_id: Option<Uuid>,
     },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DeploymentMetadata {
+    id: Uuid,
+    base_deployment_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
