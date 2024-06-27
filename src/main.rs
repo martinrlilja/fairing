@@ -16,6 +16,7 @@ use fastbloom::BloomFilter;
 use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{HashMap, HashSet},
     io::{Cursor, Read},
     path::PathBuf,
     sync::Arc,
@@ -651,34 +652,179 @@ async fn create_deployment(
     State(state): State<Arc<AppState>>,
     Json(create_deployment): Json<CreateDeployment>,
 ) -> (StatusCode, Json<Deployment>) {
-    use arrow::array::{ArrayRef, FixedSizeBinaryArray, RecordBatch, StringArray};
+    use arrow::array::{
+        cast::downcast_array, ArrayRef, BooleanArray, FixedSizeBinaryArray, RecordBatch,
+        StringArray,
+    };
+    use futures::TryStreamExt;
     use parquet::{
-        arrow::async_writer::AsyncArrowWriter, basic::Compression,
-        file::properties::WriterProperties, format::SortingColumn,
+        arrow::{
+            arrow_reader::{ArrowPredicateFn, RowFilter},
+            async_reader::ParquetObjectReader,
+            async_writer::AsyncArrowWriter,
+            ParquetRecordBatchStreamBuilder, ProjectionMask,
+        },
+        basic::Compression,
+        file::properties::WriterProperties,
+        format::SortingColumn,
     };
 
-    // todo: do a diff of files that need to be uploaded, and mark the deployment metadata
-    // with the id of the deployment the diff is based on to detect stale deployments.
-    let deployment = Deployment {
-        id: Uuid::now_v7(),
-        files_to_upload: create_deployment
-            .files
-            .iter()
-            .map(|file| file.path.clone())
-            .collect(),
-    };
-
-    let deployment_dir_path = state
+    let site_path = state
         .base_path
         .child("sites")
-        .child(create_deployment.site_name.as_str())
+        .child(create_deployment.site_name.as_str());
+    let site_metadata_path = site_path.child("metadata.bc");
+
+    let bincode_options = bincode::options();
+
+    let site_metadata = match state.object_store.get(&site_metadata_path).await {
+        Ok(site_metadata_obj) => {
+            let site_metadata_raw = site_metadata_obj.bytes().await.unwrap();
+            let site_metadata: SiteMetadataFormat =
+                bincode_options.deserialize(&site_metadata_raw).unwrap();
+
+            site_metadata
+        }
+        Err(object_store::Error::NotFound { .. }) => {
+            panic!();
+            // return StatusCode::NOT_FOUND;
+        }
+        Err(err) => {
+            tracing::error!("get_file: metadata {err:?}");
+            panic!();
+            // return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+
+    let site_metadata = match site_metadata {
+        SiteMetadataFormat::V1Alpha1 {
+            current_deployment_id,
+            finalized_deployment_ids,
+            bloom_filter_seed,
+            bloom_filter,
+        } => SiteMetadata {
+            current_deployment_id,
+            finalized_deployment_ids,
+            bloom_filter_seed,
+            bloom_filter,
+        },
+    };
+
+    let mut files_to_upload = create_deployment
+        .files
+        .iter()
+        .map(|file| {
+            (
+                file.path.clone(),
+                blake3::Hash::from_hex(&file.hash).unwrap(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let bloom_filter = BloomFilter::from_vec(site_metadata.bloom_filter)
+        .seed(&site_metadata.bloom_filter_seed)
+        .hashes(20);
+
+    let _base_deployment_id = site_metadata.finalized_deployment_ids.first().cloned();
+
+    for old_deployment_id in site_metadata.finalized_deployment_ids.iter() {
+        let found_files = create_deployment
+            .files
+            .iter()
+            .filter_map(|file| {
+                let path_hash = blake3::hash(&file.path.as_bytes());
+
+                if bloom_filter.contains(&(old_deployment_id, path_hash)) {
+                    Some(file.path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<HashSet<_>>();
+
+        if found_files.is_empty() {
+            continue;
+        }
+
+        let deployment_dir_path = site_path
+            .child("deployments")
+            .child(old_deployment_id.to_string());
+
+        let deployment_files_path = deployment_dir_path.child("files.parquet");
+
+        let deployment_files_meta = state
+            .object_store
+            .head(&deployment_files_path)
+            .await
+            .unwrap();
+
+        let reader = ParquetObjectReader::new(state.object_store.clone(), deployment_files_meta);
+        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .with_batch_size(1024);
+
+        let file_metadata = builder.metadata().file_metadata();
+
+        /*
+        let scalar = StringArray::from(
+            found_files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>(),
+        );
+        */
+
+        let filter = ArrowPredicateFn::new(
+            ProjectionMask::roots(file_metadata.schema_descr(), [0]),
+            move |record_batch| {
+                let path_array: StringArray = downcast_array(record_batch.column(0));
+                Ok(BooleanArray::from_unary(&path_array, |path| {
+                    found_files.contains(path)
+                }))
+            },
+        );
+
+        let mask = ProjectionMask::roots(file_metadata.schema_descr(), [0, 1]);
+        let builder = builder
+            .with_projection(mask)
+            .with_row_filter(RowFilter::new(vec![Box::new(filter)]));
+
+        let mut stream = builder.build().unwrap();
+
+        while let Some(file) = stream.try_next().await.unwrap() {
+            let path_array: StringArray = downcast_array(file.column(0));
+            let hash_array: FixedSizeBinaryArray = downcast_array(file.column(1));
+
+            for (path, hash) in path_array.iter().zip(hash_array.iter()) {
+                let (Some(path), Some(hash)) = (path, hash) else {
+                    continue;
+                };
+
+                let Some(new_hash) = files_to_upload.get(path) else {
+                    continue;
+                };
+
+                if new_hash.as_bytes() == hash {
+                    files_to_upload.remove(path);
+                }
+            }
+        }
+    }
+
+    let files_to_upload = files_to_upload.into_iter().collect::<Vec<_>>();
+
+    let deployment_id = Uuid::now_v7();
+
+    let deployment_dir_path = site_path
         .child("deployments")
-        .child(deployment.id.to_string());
+        .child(deployment_id.to_string());
 
     let deployment_path = deployment_dir_path.child("metadata.json");
 
     let deployment_files_path = deployment_dir_path.child("files.parquet");
 
+    // TODO: store the base id
     let deployment_stage_meta = serde_json::to_vec(&create_deployment).unwrap();
 
     // println!("writing {} bytes json", deployment_stage_meta.len());
@@ -714,16 +860,15 @@ async fn create_deployment(
     let mut writer =
         AsyncArrowWriter::try_new(&mut buffer, sample.schema(), Some(writer_props)).unwrap();
 
-    for chunk in files.chunks(1024) {
+    for chunk in files_to_upload.chunks(1024) {
         let paths = Arc::new(StringArray::from_iter_values(
-            chunk.iter().map(|v| v.path.clone()),
+            chunk.iter().map(|(path, _hash)| path.clone()),
         )) as ArrayRef;
 
         let hashes = Arc::new(
-            FixedSizeBinaryArray::try_from_iter(chunk.iter().map(|v| {
-                let hash: blake3::Hash = v.hash.parse().unwrap();
-                hash.as_bytes().to_vec()
-            }))
+            FixedSizeBinaryArray::try_from_iter(
+                chunk.iter().map(|(_path, hash)| hash.as_bytes().to_vec()),
+            )
             .unwrap(),
         ) as ArrayRef;
 
@@ -741,6 +886,14 @@ async fn create_deployment(
         .put(&deployment_files_path, buffer.into())
         .await
         .unwrap();
+
+    let deployment = Deployment {
+        id: deployment_id,
+        files_to_upload: files_to_upload
+            .into_iter()
+            .map(|(path, _hash)| path)
+            .collect(),
+    };
 
     (StatusCode::CREATED, Json(deployment))
 }
@@ -874,6 +1027,12 @@ async fn update_site(
     Path(site_name): Path<String>,
     Json(update_site): Json<UpdateSite>,
 ) -> StatusCode {
+    use arrow::array::{cast::downcast_array, StringArray};
+    use futures::TryStreamExt;
+    use parquet::arrow::{
+        async_reader::ParquetObjectReader, ParquetRecordBatchStreamBuilder, ProjectionMask,
+    };
+
     let site_path = state.base_path.child("sites").child(site_name.as_str());
     let site_metadata_path = site_path.child("metadata.bc");
 
@@ -917,10 +1076,11 @@ async fn update_site(
     };
 
     if let Some(finalize_deployment_id) = update_site.finalize_deployment_id {
-        let deployment_path = site_path
+        let deployment_dir_path = site_path
             .child("deployments")
             .child(finalize_deployment_id.to_string());
-        let deployment_metadata_path = deployment_path.child("metadata.json");
+
+        let deployment_metadata_path = deployment_dir_path.child("metadata.json");
 
         let deployment_metadata_obj = state
             .object_store
@@ -930,36 +1090,61 @@ async fn update_site(
 
         let deployment_metadata = deployment_metadata_obj.bytes().await.unwrap();
 
-        let deployment_metadata: CreateDeployment =
+        let _deployment_metadata: CreateDeployment =
             serde_json::from_slice(&deployment_metadata).unwrap();
 
         // todo: verify if the deployment is stale.
+
+        let deployment_files_path = deployment_dir_path.child("files.parquet");
+
+        let deployment_files_meta = state
+            .object_store
+            .head(&deployment_files_path)
+            .await
+            .unwrap();
+
+        let reader = ParquetObjectReader::new(state.object_store.clone(), deployment_files_meta);
+        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .with_batch_size(1024);
+
+        let file_metadata = builder.metadata().file_metadata();
+
+        let mask = ProjectionMask::roots(file_metadata.schema_descr(), [0]);
+        let builder = builder.with_projection(mask);
+
+        let mut stream = builder.build().unwrap();
 
         let mut bloom_filter = BloomFilter::from_vec(site_metadata.bloom_filter)
             .seed(&site_metadata.bloom_filter_seed)
             .hashes(20);
 
-        for file in deployment_metadata.files.iter() {
-            let path_hash = blake3::hash(&file.path.as_bytes());
-            let path_hash_hex = path_hash.to_hex();
+        while let Some(file) = stream.try_next().await.unwrap() {
+            let path_array: StringArray = downcast_array(file.column(0));
 
-            let file_path = deployment_path
-                .child("files")
-                .child(&path_hash_hex[..2])
-                .child(&path_hash_hex[2..]);
+            for path in path_array.iter().filter_map(|path| path) {
+                let path_hash = blake3::hash(&path.as_bytes());
+                let path_hash_hex = path_hash.to_hex();
 
-            match state.object_store.head(&file_path).await {
-                Ok(_) => (),
-                Err(object_store::Error::NotFound { .. }) => {
-                    return StatusCode::BAD_REQUEST;
-                }
-                Err(err) => {
-                    tracing::error!("get_file: metadata {err:?}");
-                    return StatusCode::INTERNAL_SERVER_ERROR;
-                }
-            };
+                let file_path = deployment_dir_path
+                    .child("files")
+                    .child(&path_hash_hex[..2])
+                    .child(&path_hash_hex[2..]);
 
-            bloom_filter.insert(&(finalize_deployment_id, path_hash));
+                match state.object_store.head(&file_path).await {
+                    Ok(_) => (),
+                    Err(object_store::Error::NotFound { .. }) => {
+                        return StatusCode::BAD_REQUEST;
+                    }
+                    Err(err) => {
+                        tracing::error!("get_file: metadata {err:?}");
+                        return StatusCode::INTERNAL_SERVER_ERROR;
+                    }
+                };
+
+                bloom_filter.insert(&(finalize_deployment_id, path_hash));
+            }
         }
 
         site_metadata
@@ -1024,6 +1209,14 @@ struct CreateDeploymentFiles {
 struct Deployment {
     id: Uuid,
     files_to_upload: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+enum DeploymentMetadataFormat {
+    V1Alpha1 {
+        id: Uuid,
+        base_deployment_id: Option<Uuid>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
