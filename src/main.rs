@@ -776,15 +776,6 @@ async fn create_deployment(
 
         let file_metadata = builder.metadata().file_metadata();
 
-        /*
-        let scalar = StringArray::from(
-            found_files
-                .iter()
-                .map(|file| file.path.clone())
-                .collect::<Vec<_>>(),
-        );
-        */
-
         let filter = ArrowPredicateFn::new(
             ProjectionMask::roots(file_metadata.schema_descr(), [0]),
             move |record_batch| {
@@ -839,7 +830,7 @@ async fn create_deployment(
         })
         .unwrap();
 
-    // metadata.json must be created first to avoid data races.
+    // metadata.bc must be created first to avoid data races.
     state
         .object_store
         .put_opts(
